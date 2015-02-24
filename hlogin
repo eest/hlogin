@@ -1,0 +1,161 @@
+#!/usr/bin/env perl
+#
+# Copyright (c) 2014 Patrik Lundin <patrik.lundin.swe@gmail.com>
+#
+# Permission to use, copy, modify, and distribute this software for any
+# purpose with or without fee is hereby granted, provided that the above
+# copyright notice and this permission notice appear in all copies.
+#
+# THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+# WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+# MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+# ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+# WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+# ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+# OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+#
+
+#
+# This script shows successful authentication requests against heimdal (AS-REQ + Pre-authentication succeeded)
+# These events are printed on different lines and only the AS-REQ contains the IP-address.
+#
+# You may supply IP-addresses that you are interested in as arguments (see usage).
+#
+
+use strict;
+use warnings;
+
+my $DEBUG = 0;
+
+my $parsing_as_req = 0;
+my $pre_auth_succeded = 0;
+
+my $initial_address = "";
+my $final_address = "";
+my $initial_uid = "";
+my $final_uid = "";
+my $initial_realm = "";
+my $final_realm = "";
+
+my @IP_ACL;
+my $quoted_ip;
+
+my $num_args = @ARGV;
+
+if ($num_args < 1){
+    print "usage: $0 <logfile> [ip1 [ip2] ...]\n";
+    exit 1;
+}
+
+my $logfile = $ARGV[0];
+
+if ($num_args > 1){
+    shift @ARGV;
+    foreach (@ARGV){
+        push @IP_ACL, $_;
+    }
+}
+
+open (FH, "<", $logfile) or die "open failed: $!\n";
+
+while(<FH>){
+    # Feb  1 00:00:01 hostname kdc[xxxx]: AS-REQ user@REALM from IPv4:10.0.0.1 for krbtgt/REALM@REALM
+    if (/^(?<month>[a-zA-Z]+)\s+(?<monthday>[0-9]+)\s+(?<time>[0-9]+:[0-9]+:[0-9]+)\s+(?<hostname>[^\s]+)\s+(?<process>[^\[]+)(\[[0-9]+\])?:\s+(?<message>.*)$/){
+        my $message = $+{message};
+        my $process = $+{process};
+        my $month = $+{month};
+        my $monthday = $+{monthday};
+        my $time = $+{time};
+
+        if ($process =~ /^kdc$/){
+            print "message: $message\n" if $DEBUG;
+            if ($message =~ /^AS-REQ (?<initial_uid>[^\@]+)\@(?<initial_realm>[^\s]+) from [^:]+:(?<initial_address>[^\s]+)\sfor /){
+                # AS-REQ user@REALM from IPv4:10.0.0.1 for krbtgt/REALM@REALM
+
+                if ($parsing_as_req){
+                    die "Saw AS-REQ but is already parsing another AS-REQ\n";
+                }
+
+                $initial_address = $+{initial_address};
+                $initial_uid = $+{initial_uid};
+                $initial_realm = $+{initial_realm};
+                $parsing_as_req = 1;
+            }
+            elsif($message =~ /^ENC-TS Pre-authentication succeeded -- (?<final_uid>[^\@]+)\@(?<final_realm>[^\s]+) using (?<pa_enctype>[^\s]+)/){
+                # ENC-TS Pre-authentication succeeded -- user@REALM using enctype-spec-word
+
+                if (not $parsing_as_req){
+                    die "Saw Pre-authentication succeeded but no AS-REQ\n";
+                }
+
+                if ($pre_auth_succeded){
+                    die "Saw Pre-authentication succeeded but has already seen that\n";
+                }
+
+                $final_uid = $+{final_uid};
+                $final_realm = $+{final_realm};
+
+                if ($initial_uid ne $final_uid){
+                    die "pre-auth-succeded: initial uid does not match final uid\n\tinitial_uid: $initial_uid\n\tfinal_uid: $final_uid\n";
+                }
+
+                if ($initial_realm ne $final_realm){
+                    die "pre-auth-succeded: initial realm does not match final realm\n\tinitial_realm: $initial_realm\n\tfinal_realm: $final_realm\n";
+                }
+
+                $pre_auth_succeded = 1;
+            }
+            elsif($message =~ /Pre-authentication succeeded/i){
+                # If we match this regex but not the previous one this is probably not ENC-TS
+                die "Unexpected Pre-authentication method encountered: $message\n"
+            }
+            elsif($message =~ /^sending [0-9]+ bytes to [^:]+:(?<final_address>[^\s]+)/){
+                # sending 100 bytes to IPv4:10.0.0.1
+                if ($parsing_as_req){
+                    $final_address = $+{final_address};
+
+                    if ($initial_address ne $final_address) {
+                        die "addresses are not in sync, exiting...\ninitial_address: $initial_address\nfinal_address: $final_address\n";
+                    }
+
+                    my $matching = 0;
+
+                    if (@IP_ACL){
+                        my $quoted_address = $final_address;
+                        $quoted_address =~ s,\.,\\.,g;
+                        $matching = grep (/^$quoted_address$/, @IP_ACL)
+                    }
+                    else {
+                        $matching = 1;
+                    }
+
+                    if ($pre_auth_succeded and $matching){
+                        print "$month $monthday $time: $final_uid\@$final_realm at $final_address\n";
+                    }
+
+                    # Reset variables
+                    $parsing_as_req = 0;
+                    $pre_auth_succeded = 0;
+
+                    $initial_address = "";
+                    $final_address = "";
+                    $initial_uid = "";
+                    $final_uid = "";
+                    $initial_realm = "";
+                    $final_realm = "";
+                }
+            }
+        }
+    }
+    elsif (/^(?<month>[a-zA-Z]+)\s+(?<monthday>[0-9]+)\s+(?<time>[0-9]+:[0-9]+:[0-9]+)\s+(?<hostname>[^\s]+) last message repeated [0-9]+ times/){
+        # Feb  3 01:08:20 hostname last message repeated 2 times
+        next;
+    }
+    elsif (/^$/){
+        # empty line
+        next;
+    }
+    else {
+        die "failed parsing log: $_\n";
+    }
+}
